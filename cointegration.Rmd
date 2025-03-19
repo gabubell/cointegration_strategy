@@ -1,0 +1,465 @@
+---
+title: "Trabalho de cointegração"
+output:
+  html_document:
+    df_print: paged
+---
+
+### Pacotes
+
+```{r setup, include=FALSE} 
+knitr::opts_chunk$set(warning = FALSE, message = FALSE) 
+```
+
+
+```{r}
+#Packages names
+packages <- c('tidyverse', 'BatchGetSymbols', 'egcm', 'scales')
+
+#Install packages not yet installed
+installed_packages <- packages %in% rownames(installed.packages())
+if (any(installed_packages == FALSE)) {
+  install.packages(packages[!installed_packages])
+}
+
+#Load them
+invisible(lapply(packages, library, character.only = TRUE))
+```
+
+
+### Plota o índice IBOV
+
+```{r}
+bvsp = BatchGetSymbols('^BVSP', first.date = as.Date('2016-01-01'),
+ last.date = as.Date('2021-08-01'))
+```
+
+```{r}
+ggplot(bvsp$df.tickers, aes(x = as.Date(ref.date), y = price.close))+
+  geom_line() +
+  theme_bw() +
+  scale_x_date(date_breaks = "3 month",
+               date_labels = '%m-%y',
+               limit = c(as.Date('2016-01-01'), as.Date('2021-08-01'))) +
+  theme(axis.text.x=element_text(angle=60, hjust=1)) + 
+  xlab('')+ ylab('Pontos')+
+  labs(title='Índice Bovespa')
+```
+
+### Coleta os dados
+
+```{r, eval = F}
+#Coleta o nome das ações
+acoes <- GetIbovStocks()$tickers
+acoes.sa <- paste0(acoes, '.SA')
+```
+```{r}
+#Because BatchGetSymbols pkg has been discontinued, I retrieve local stored files to get all tickers in the Ibov index
+acoes.sa <- readRDS('old_data_ibv.rds') %>% 
+  pluck('df.tickers') %>% 
+  pull('ticker') %>% 
+  unique()
+```
+
+```{r, eval = F}
+#Baixa os dados
+data_ibv <- BatchGetSymbols(tickers = acoes.sa,
+                            first.date = '2018-01-01',
+                            last.date = '2020-01-01',
+                            freq.data = 'daily')
+saveRDS(data_ibv, 'data_ibv.rds')
+```
+
+```{r}
+data_ibv <- readRDS('data_ibv.rds')
+```
+
+
+```{r}
+#Limpa os dados, utiliza o preço ajustado e o valor diário
+cleaned_data <- data_ibv$df.tickers %>% 
+  as_tibble() %>% 
+  rename(date = ref.date) %>% 
+  relocate(date, ticker, price.adjusted) %>% 
+  select(c(1:3)) %>% 
+  pivot_wider(names_from = ticker, values_from = price.adjusted) %>% 
+  select(where(~!any(is.na(.))))
+```
+
+```{r}
+head(cleaned_data)
+```
+
+### Testa a cointegração
+```{r}
+#Roda o teste Engle-Granger-ADF para todos os pares possíveis
+eg_test_adf <- allpairs.egcm(select(cleaned_data, -date),
+                         i1test = 'adf',
+                         urtest = 'adf',
+                         log = T)
+```
+
+```{r}
+head(eg_test_adf)
+```
+
+
+```{r}
+#Sumariza a quantidade de pares cointegrados
+qtd_coint <- eg_test_adf %>% 
+  group_by(is.cointegrated) %>% 
+  summarise(qtd = n())
+
+qtd_coint
+```
+
+```{r}
+eg_test_johansen <- allpairs.egcm(select(cleaned_data, -date),
+                         i1test = 'adf',
+                         urtest = 'jo-e',
+                         log = T)
+```
+
+```{r}
+#Sumariza a quantidade de pares cointegrados
+qtd_coint <- eg_test_johansen %>% 
+  group_by(is.cointegrated) %>% 
+  summarise(qtd = n())
+
+qtd_coint
+```
+
+```{r}
+#Seleciona as séries que são cointegradas nos dois testes
+coint_both <- eg_test_adf %>% 
+  filter(is.cointegrated) %>% 
+  select(c(series1, series2, urtest, alpha, beta, r.p)) %>% 
+  inner_join(eg_test_johansen %>% 
+              filter(is.cointegrated) %>% 
+              select(c(series1, series2)),
+            by = c('series1', 'series2'))
+```
+
+```{r}
+#Sumariza a quantidade de pares cointegrados
+nrow(coint_both)
+```
+
+```{r}
+#Seleciona os 10 pares com o menor p-valor no teste adf
+
+amostra <- coint_both %>% 
+  arrange(r.p) %>% 
+  head(12)
+
+amostra
+```
+
+
+### Calcula o spread entre ações
+
+```{r}
+#Coleta o coeficiente de integração 
+coef_coint <- amostra %>% 
+  select(c(series1, series2,alpha, beta)) %>% 
+  rename(x = series1, y = series2)
+
+head(coef_coint)
+```
+
+```{r}
+#Baixa os dados
+acoes_coint <- coef_coint %>% 
+  pivot_longer(-c(alpha, beta)) %>% 
+  pluck('value') %>% 
+  unique()
+
+pos_covid_raw <- BatchGetSymbols(tickers = acoes_coint,
+                             first.date = '2018-01-01',
+                             last.date = '2021-04-01',
+                             freq.data = 'daily')
+```
+
+```{r}
+#Limpa os dados, utiliza o preço ajustado e o valor diário
+pos_covid <- pos_covid_raw$df.tickers %>% 
+  as_tibble() %>% 
+  rename(date = ref.date) %>% 
+  relocate(date, ticker, price.adjusted) %>% 
+  select(c(1:3)) 
+```
+
+```{r}
+#Função que calcula o spread
+calc_spread <- function(x_ticker, y_ticker) {
+  x <- pos_covid %>% 
+    filter(ticker == x_ticker) %>% 
+    rename(x = ticker) %>% 
+    mutate(price.adjusted = log(price.adjusted))
+  
+  y <- pos_covid %>% 
+    filter(ticker == y_ticker) %>% 
+    rename(y = ticker) %>% 
+    mutate(price.adjusted = log(price.adjusted))
+  
+  spread <- left_join(x, y, by = 'date') %>% 
+    left_join(coef_coint) %>% 
+    mutate(spread_vl = price.adjusted.y - (beta*price.adjusted.x))
+
+  result_spread <<- result_spread %>% 
+    bind_rows(spread)
+}
+```
+
+```{r}
+#Calcula o spread para todo o período
+result_spread <- tibble()
+for (row in 1:nrow(coef_coint)) {
+  calc_spread(slice(coef_coint, row)$x, slice(coef_coint, row)$y)
+}
+
+head(result_spread)
+```
+
+### Calcula o spread entre ações escaladas pelo z-score
+
+```{r}
+#Calcula a média e desvio padrão para cada combinação no período de treino
+#Isto permitirá a padronização z-score
+
+mean_sd <- result_spread %>% 
+  filter(date < '2020-01-01') %>% 
+  group_by(x, y) %>% 
+  summarise(mean = mean(spread_vl),
+            sd = sd(spread_vl)) %>% 
+  ungroup()
+```
+
+```{r}
+#Escala z-score toda a base, inclusive a fora da amostra de teste
+scaled_spread <- result_spread %>% 
+  left_join(mean_sd) %>% 
+  mutate(spread_z = (spread_vl - mean) / sd)
+```
+```{r}
+head(scaled_spread)
+```
+
+#Algumas visualizações
+
+```{r}
+data_viz <- scaled_spread %>% 
+  filter(x == 'ENGI11.SA', y == 'LREN3.SA') %>% 
+  select(c(date, x, y, price.adjusted.x, price.adjusted.y)) %>% 
+  mutate(price.adjusted.x = price.adjusted.x * 1.0872934) %>% 
+  pivot_longer(cols = c(x,y), values_to = 'ticker', names_to = 'a') %>% 
+  pivot_longer(cols = c(price.adjusted.x, price.adjusted.y),
+               values_to = 'price', names_to = 'b') %>% 
+  mutate(b = str_extract(b, '.$')) %>% 
+  filter(a == b) %>% 
+  select(-c(a,b))
+
+ggplot(data_viz, aes(x = date, y = price))+
+  geom_line(aes(color = ticker)) +
+  theme_bw() +
+  scale_x_date(date_breaks = "3 month",
+               date_labels = '%m-%Y',
+               limit = c(as.Date('2018-01-01'), as.Date('2021-04-01'))) +
+  theme(axis.text.x=element_text(angle=60, hjust=1)) + 
+  xlab('')+ ylab('LN') +
+  labs(
+    title = 'Preço em ln ajustado pelo beta',
+    subtitle = 'alpha = -0.30, beta = 1.087'
+  )
+
+```
+
+```{r}
+viz_z <- scaled_spread %>% 
+  filter(x == 'ENGI11.SA', y == 'LREN3.SA') %>% 
+  select(c(date, spread_z)) 
+
+ggplot(viz_z, aes(x = date, y = spread_z))+
+  theme_bw() +
+  geom_line() +
+  scale_x_date(date_breaks = "3 month",
+               date_labels = '%m-%Y',
+               limit = c(as.Date('2018-01-01'), as.Date('2021-04-01'))) +
+  theme(axis.text.x=element_text(angle=60, hjust=1)) + 
+  xlab('')+ ylab('Z-Score') +
+  labs(
+    title = 'x = ENGI11.SA, y = LREN3.SA'
+  )
+```
+
+```{r}
+viz_z_all <- scaled_spread %>% 
+  mutate(par = paste0(y, '_',x)) %>% 
+  select(c(date, par, spread_z)) 
+
+ggplot(viz_z_all, aes(x = date, y=spread_z)) +
+  theme_bw() +
+  geom_line() +
+  scale_x_date(date_breaks = "3 month",
+               date_labels = '%m-%Y',
+               limit = c(as.Date('2018-01-01'), as.Date('2021-04-01'))) +
+  theme(axis.text.x=element_text(angle=60, hjust=1)) + 
+  facet_wrap(~par, scale = 'free_y')
+```
+
+### Aplica a estrategia de long-short 
+
+```{r}
+result <- tibble(
+  pair = c(),
+  date = c(),
+  x_price = c(),
+  y_price = c(),
+  spread_z = c(),
+  operation = c()
+)
+
+coef_coint <- coef_coint %>% 
+  filter(x %in% unique(scaled_spread$x)) %>% 
+  filter(y %in% unique(scaled_spread$y))
+
+for (row_coef in 1:nrow(coef_coint)) {
+  data_set <- scaled_spread %>% 
+    filter(date > as.Date('2020-01-01')) %>% 
+    filter(x == slice(coef_coint, row_coef)$x &
+             y == slice(coef_coint, row_coef)$y) 
+  
+  short_on = F
+  long_on = F
+  
+  for (row in 1:nrow(data_set)) {
+    date <- slice(data_set, row)$date
+    x_price <- slice(data_set, row)$price.adjusted.x
+    y_price <- slice(data_set, row)$price.adjusted.y
+    spread_z <- slice(data_set, row)$spread_z
+    
+    #Operação de short
+    if (spread_z > 2) {
+      if(!short_on) {
+        short_on = T
+        result <<- result %>% 
+          bind_rows(
+            tibble(
+              pair = paste0(slice(coef_coint, row_coef)$x, '_',
+                          slice(coef_coint, row_coef)$y),
+              date = date,
+              x_price = exp(x_price),
+              y_price = exp(y_price),
+              spread_z = spread_z,
+              operation = 'short'
+            )
+          )
+        date_short <- date
+      }
+    } else if (spread_z < 0.75 & short_on) {
+      short_on = F
+      result <<- result %>% 
+        bind_rows(
+          tibble(
+            pair = paste0(slice(coef_coint, row_coef)$x, '_',
+                        slice(coef_coint, row_coef)$y),
+            date = date,
+            x_price = exp(x_price),
+            y_price = exp(y_price),
+            spread_z = spread_z,
+            operation = 'close_short'
+          )
+        )
+    }
+    if (short_on) {
+      if((date >= date_short + 120) || date >= as.Date('2021-03-30')) {
+        short_on = F
+        result <<- result %>% 
+          bind_rows(
+            tibble(
+              pair = paste0(slice(coef_coint, row_coef)$x, '_',
+                          slice(coef_coint, row_coef)$y),
+              date = date,
+              x_price = exp(x_price),
+              y_price = exp(y_price),
+              spread_z = spread_z,
+              operation = 'close_short_time'
+            )
+          )
+      }
+    }
+    #Operacao de long
+    if (spread_z < -2) {
+      if(!long_on) {
+        long_on = T
+        result <<- result %>% 
+          bind_rows(
+            tibble(
+              pair = paste0(slice(coef_coint, row_coef)$x, '_',
+                          slice(coef_coint, row_coef)$y),
+              date = date,
+              x_price = exp(x_price),
+              y_price = exp(y_price),
+              spread_z = spread_z,
+              operation = 'long'
+            )
+          )
+        date_long <- date
+      }
+    } else if (spread_z > 0.5 & long_on) {
+      long_on = F
+      result <<- result %>% 
+        bind_rows(
+          tibble(
+            pair = paste0(slice(coef_coint, row_coef)$x, '_',
+                        slice(coef_coint, row_coef)$y),
+            date = date,
+            x_price = exp(x_price),
+            y_price = exp(y_price),
+            spread_z = spread_z,
+            operation = 'close_long'
+          )
+        )
+    }
+    if (long_on) {
+      if((date >= date_long + 120) || date >= as.Date('2021-03-30')) {
+        long_on = F
+        result <<- result %>% 
+          bind_rows(
+            tibble(
+              pair = paste0(slice(coef_coint, row_coef)$x, '_',
+                          slice(coef_coint, row_coef)$y),
+              date = date,
+              x_price = exp(x_price),
+              y_price = exp(y_price),
+              spread_z = spread_z,
+              operation = 'close_long_time'
+            )
+          )
+      }
+    }
+  }
+}
+
+
+```
+
+```{r}
+writexl::write_xlsx(result %>% 
+                      group_by(pair, date, spread_z) %>% 
+                      filter(n() == 1),
+                    'trading_120dias_2021.09.19.xlsx')
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
